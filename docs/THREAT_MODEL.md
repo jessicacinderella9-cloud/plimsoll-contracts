@@ -261,7 +261,7 @@ Any address with the `Auditor` role. Its reports are `AuditorSigned`
   admin's `max_reporters` cap bounds the asset as a whole. Auditors appointed
   by the registry admin can fill a tier, or the asset, so that a further
   honest auditor gets `TooManyReporters` or `TooManyReportersPerAsset` until
-  one of them is revoked. The default cap of 20 is above the twelve reporters
+  one of them is revoked. The default cap of 20 is above the twelve entries
   the tier caps allow, so it only bites once an admin lowers it.
 
 **What limits it today:**

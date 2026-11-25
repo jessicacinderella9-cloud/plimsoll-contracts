@@ -336,9 +336,9 @@ Rules:
   like anyone else. A v0.1 `Report(sac, tier)` entry counts until its tier is
   migrated. When both caps apply, `TooManyReporters` (the tier) is checked
   first. The setting defaults to `DEFAULT_MAX_REPORTERS_PER_ASSET = 20`, above
-  the twelve distinct reporters the per-tier caps allow, so it only binds once
-  an admin lowers it; it is the knob for bounding how many figures
-  `get_reports` walks.
+  the twelve entries the per-tier caps allow (four at each of three tiers), so
+  it only binds once an admin lowers it. It is the knob for bounding how many
+  figures `get_reports` walks.
 - `post_reserve` rejects a figure whose coverage against the stored supply
   would fall outside `MIN_PLAUSIBLE_BPS = 1` (0.01%) to
   `MAX_PLAUSIBLE_BPS = 1_000_000` (10,000%), with `ImplausibleAmount`. Amounts

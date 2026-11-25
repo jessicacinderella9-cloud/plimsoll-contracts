@@ -1803,8 +1803,9 @@ fn the_default_cap_clears_the_most_reporters_the_tier_caps_allow() {
         post(&f, reporter, UNIT, T0 - 100 + i as u64);
     }
 
-    // Four auditors and four transcribers: eight distinct reporters, twelve
-    // being the most the tier caps allow, both under the default cap of 20.
+    // Four auditors and four transcribers: eight distinct reporters, and the
+    // tier caps allow at most twelve entries across the three tiers, both
+    // under the default cap of 20.
     assert_eq!(
         f.ledger.get_reports(&f.sac).len(),
         2 * MAX_REPORTERS_PER_TIER,

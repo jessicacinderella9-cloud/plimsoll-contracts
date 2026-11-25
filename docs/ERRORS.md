@@ -96,9 +96,8 @@ these errors reach maintainers rather than end users.
 
 - **Raised by:** `set_max_reporters(max)`.
 - **Cause:** `max` is zero, which would stop every asset taking a new reporter.
-- **Remedy:** Set at least 1. The default is 20, and the per-tier caps allow at
-  most twelve distinct reporters per asset, so a value of 12 or more only
-  starts to bind if a tier cap is raised later.
+- **Remedy:** Set at least 1. The default is 20, above what the per-tier caps
+  allow, so a value only changes anything when the admin lowers it.
 
 ### 6 `EmptyBatch`
 
@@ -264,7 +263,7 @@ when several apply the caller sees the first:
   figures. A new reporter needs a maintainer to revoke one of the reporters
   holding a slot, or to raise the cap with
   `reporter-registry.set_max_reporters(n)`. With the default cap this error is
-  unreachable, because the per-tier caps allow at most twelve reporters per
+  unreachable, because the per-tier caps allow at most twelve entries per
   asset and `TooManyReporters` is checked first.
 
 ## VaultError
