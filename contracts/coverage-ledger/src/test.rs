@@ -1859,13 +1859,8 @@ fn a_batch_registered_reporter_still_hits_the_asset_cap() {
     ));
     post(&f, &first, UNIT, T0 - 100);
 
-    let res = f.ledger.try_post_reserve(
-        &second,
-        &f.sac,
-        &UNIT,
-        &T0,
-        &hash(&f.env, 5),
-        &uri(&f.env),
-    );
+    let res =
+        f.ledger
+            .try_post_reserve(&second, &f.sac, &UNIT, &T0, &hash(&f.env, 5), &uri(&f.env));
     assert_eq!(res, Err(Ok(LedgerError::TooManyReportersPerAsset.into())));
 }
