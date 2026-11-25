@@ -1,5 +1,5 @@
 {
-  "_comment": "CPU instruction and memory ceilings for the coverage-ledger calls that matter on other contracts' hot paths. Measured natively by the resource-budget tests in contracts/coverage-ledger/src/test.rs, with about 20% headroom over the cost on 2026-11-21. Raise a ceiling deliberately, in the commit that needs the room, so growth is argued for rather than absorbed.",
+  "_comment": "CPU instruction and memory ceilings for the coverage-ledger calls that matter on other contracts' hot paths. Measured natively by the resource-budget tests in contracts/coverage-ledger/src/test.rs, with about 20% headroom over the cost on 2026-11-21. Raise a ceiling deliberately, in the commit that needs the room, so growth is argued for rather than absorbed. post_reserve raised on 2026-11-25 for the per-asset reporter cap (#109): a reporter new to an asset now costs one more cross-contract read, reporter-registry.max_reporters, plus the reads that count the asset's reporters. Re-measure on the next run of the budget tests and tighten it.",
   "functions": {
     "is_covered": {
       "cpu_instructions": 155000,
@@ -10,8 +10,8 @@
       "memory_bytes": 116000
     },
     "post_reserve": {
-      "cpu_instructions": 285000,
-      "memory_bytes": 147000
+      "cpu_instructions": 320000,
+      "memory_bytes": 165000
     }
   }
 }

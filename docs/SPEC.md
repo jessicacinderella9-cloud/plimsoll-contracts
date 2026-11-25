@@ -28,7 +28,7 @@ plimsoll-types   (library crate: shared types, cross-contract client traits)
       │
       ├── reporter-registry   (no contract dependencies)
       │
-      ├── coverage-ledger     ──calls──▶ reporter-registry.role_of
+      ├── coverage-ledger     ──calls──▶ reporter-registry.role_of, max_reporters
       │                       ──calls──▶ <SAC>.name
       │
       └── covered-vault       ──calls──▶ coverage-ledger.is_covered
@@ -46,6 +46,7 @@ it exists to show the integration in about 100 lines.
 | `Role` | `u32` enum | `Auditor = 1`, `Transcriber = 2`, `SupplyPoster = 3` |
 | `Tier` | `u32` enum | `Transcribed = 1`, `IssuerSigned = 2`, `AuditorSigned = 3` (ordered: higher is stronger) |
 | `ReporterInfo` | struct | `role: Role`, `name: String`, `added_at: u64` |
+| `ReporterEntry` | struct | `reporter: Address`, `role: Role`, `name: String` |
 | `AssetRecord` | struct | `sac: Address`, `code: String`, `issuer: Address`, `listed_at: u64` |
 | `SupplySnapshot` | struct | `amount: i128`, `ledger: u32`, `timestamp: u64`, `breakdown_hash: BytesN<32>`, `poster: Address` |
 | `ReserveReport` | struct | `amount: i128`, `as_of: u64`, `posted_at: u64`, `tier: Tier`, `reporter: Address`, `doc_hash: BytesN<32>`, `doc_uri: String` |
@@ -123,8 +124,8 @@ All three contracts use the same TTL policy, defined in `plimsoll-types`:
 
 | Entry | Extended by |
 | --- | --- |
-| `Admin` (instance) | `__constructor`, `transfer_admin`, `upgrade`, `set_reporter`, `revoke` |
-| `Reporter(Address)` (persistent) | `set_reporter` (write), `get_reporter` / `role_of` (read) |
+| `Admin`, `MaxReporters` (instance) | `__constructor`, `transfer_admin`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade`, `set_reporter`, `batch_register`, `revoke`, `set_max_reporters` |
+| `Reporter(Address)` (persistent) | `set_reporter` / `batch_register` (write), `get_reporter` / `role_of` (read) |
 
 **coverage-ledger**
 
@@ -184,6 +185,7 @@ Decides who may speak. Holds no money.
 | Key | Storage | Value |
 | --- | --- | --- |
 | `Admin` | instance | `Address` |
+| `MaxReporters` | instance | `u32` (default `20`) |
 | `Reporter(Address)` | persistent, TTL extended on write and read | `ReporterInfo` |
 | `PendingUpgrade` | instance | `PendingUpgrade` |
 
@@ -194,17 +196,40 @@ Decides who may speak. Holds no money.
 | `__constructor(admin: Address)` | — | — | — | — |
 | `admin()` | — | `Address` | — | — |
 | `set_reporter(reporter: Address, role: Role, name: String)` | admin | `()` | `InvalidName` (len 0 or > 64) | `reporter_set {reporter} role, name` |
+| `batch_register(reporters: Vec<ReporterEntry>)` | admin | `()` | `InvalidName`, `EmptyBatch` | one `reporter_set {reporter} role, name` per entry |
 | `revoke(reporter: Address)` | admin | `()` | `ReporterNotFound` | `reporter_revoked {reporter}` |
 | `role_of(reporter: Address)` | — | `Option<Role>` | — | — |
 | `get_reporter(reporter: Address)` | — | `Option<ReporterInfo>` | — | — |
+| `max_reporters()` | — | `u32` | — | — |
+| `set_max_reporters(max: u32)` | admin | `()` | `InvalidMaxReporters` (zero) | `max_reporters_set {max}` |
 | `transfer_admin(new_admin: Address)` | admin and new_admin | `()` | — | `admin_transferred {new_admin}` |
 | `propose_upgrade(wasm_hash: BytesN<32>)` | admin | `()` | — | `upgrade_proposed {wasm_hash} executable_at_ledger` |
 | `execute_upgrade()` | admin | `()` | `UpgradeNotProposed`, `UpgradeDelayNotElapsed` | `upgrade_executed {wasm_hash}` |
 | `cancel_upgrade()` | admin | `()` | `UpgradeNotProposed` | `upgrade_cancelled {wasm_hash}` |
 | `pending_upgrade()` | — | `Option<PendingUpgrade>` | — | — |
 
-Errors (`RegistryError`): `ReporterNotFound = 1`, `InvalidName = 2`.
+Errors (`RegistryError`): `ReporterNotFound = 1`, `InvalidName = 2`,
+`UpgradeNotProposed = 3`, `UpgradeDelayNotElapsed = 4`,
+`InvalidMaxReporters = 5`, `EmptyBatch = 6`.
 Causes and remedies: [ERRORS.md](ERRORS.md#registryerror).
+
+Rules:
+
+- **Batch registration.** `batch_register` is `set_reporter` for a list: the
+  same name rule per entry, the same upsert (an existing reporter keeps its
+  `added_at` and changes role and name), and one `reporter_set` event per
+  entry. Every entry is validated before the first is written, and a failed
+  call reverts the transaction, so the batch is all or nothing. An empty list
+  is refused with `EmptyBatch` rather than silently doing nothing. Duplicate
+  addresses in one batch apply in order; the last entry wins.
+- **The per-asset reporter cap.** `max_reporters()` is the registry-level cap
+  on how many reporters one asset may hold, default
+  `DEFAULT_MAX_REPORTERS_PER_ASSET = 20`, set with `set_max_reporters` and read
+  by the coverage ledger when a reporter posts for an asset for the first
+  time. The registry does not know which assets a reporter will speak for, so
+  it stores the setting and does not enforce it: `set_reporter` and
+  `batch_register` cannot bypass it, because the ledger applies it at post
+  time. See [the coverage-ledger rules](#rules-1).
 
 ## coverage-ledger
 
@@ -262,7 +287,7 @@ data layouts, with real testnet examples, are in [EVENTS.md](EVENTS.md).
 | `__constructor(admin: Address, registry: Address)` | — | — | — | — |
 | `list_asset(sac: Address)` | none (permissionless) | `AssetRecord` | `NotAStellarAsset`, `AlreadyListed` | `asset_listed {sac} code, issuer` |
 | `post_supply(poster: Address, sac: Address, amount: i128, ledger: u32, breakdown_hash: BytesN<32>)` | poster | `()` | `NotSupplyPoster`, `AssetNotListed`, `InvalidAmount`, `FutureLedger`, `StaleLedger` | `supply_posted {sac} amount, ledger, breakdown_hash, poster` |
-| `post_reserve(reporter: Address, sac: Address, amount: i128, as_of: u64, doc_hash: BytesN<32>, doc_uri: String)` | reporter | `Tier` | `NotReporter`, `AssetNotListed`, `InvalidAmount`, `FutureTimestamp`, `StaleReport`, `InvalidUri`, `ImplausibleAmount`, `TooManyReporters` | `reserve_posted {sac, tier} amount, as_of, reporter, doc_hash, doc_uri` |
+| `post_reserve(reporter: Address, sac: Address, amount: i128, as_of: u64, doc_hash: BytesN<32>, doc_uri: String)` | reporter | `Tier` | `NotReporter`, `AssetNotListed`, `InvalidAmount`, `FutureTimestamp`, `StaleReport`, `InvalidUri`, `ImplausibleAmount`, `TooManyReporters`, `TooManyReportersPerAsset` | `reserve_posted {sac, tier} amount, as_of, reporter, doc_hash, doc_uri` |
 | `get_asset(sac)` | — | `Option<AssetRecord>` | — | — |
 | `get_supply(sac)` | — | `Option<SupplySnapshot>` | — | — |
 | `get_report(sac, tier: Tier)` | — | `Option<ReserveReport>` (the freshest report at that tier that counts) | — | — |
@@ -300,6 +325,20 @@ Rules:
   tier is still full it fails with `TooManyReporters`. A maintainer frees a
   slot by revoking a reporter. The cap bounds what `coverage` reads, and so
   what every `is_covered` caller pays.
+- On top of the per-tier caps, `post_reserve` enforces the registry's cap on
+  how many reporters one asset may hold. A reporter new to the asset -- no
+  stored report for it at any tier -- is refused with
+  `TooManyReportersPerAsset` when the asset already holds
+  `reporter-registry.max_reporters()` distinct reporters. Before failing, the
+  ledger drops the entries of reporters who no longer count at every tier. The
+  cap counts reporters, not entries: a reporter whose role changed and who now
+  posts at a new tier keeps their slot, and the asset's issuer occupies one
+  like anyone else. A v0.1 `Report(sac, tier)` entry counts until its tier is
+  migrated. When both caps apply, `TooManyReporters` (the tier) is checked
+  first. The setting defaults to `DEFAULT_MAX_REPORTERS_PER_ASSET = 20`, above
+  the twelve distinct reporters the per-tier caps allow, so it only binds once
+  an admin lowers it; it is the knob for bounding how many figures
+  `get_reports` walks.
 - `post_reserve` rejects a figure whose coverage against the stored supply
   would fall outside `MIN_PLAUSIBLE_BPS = 1` (0.01%) to
   `MAX_PLAUSIBLE_BPS = 1_000_000` (10,000%), with `ImplausibleAmount`. Amounts
@@ -322,7 +361,8 @@ Errors (`LedgerError`): `NotAStellarAsset = 1`, `AlreadyListed = 2`,
 `AssetNotListed = 3`, `NotSupplyPoster = 4`, `NotReporter = 5`,
 `InvalidAmount = 6`, `FutureLedger = 7`, `StaleLedger = 8`,
 `FutureTimestamp = 9`, `StaleReport = 10`, `InvalidUri = 11`,
-`ImplausibleAmount = 12`, `TooManyReporters = 13`.
+`ImplausibleAmount = 12`, `TooManyReporters = 13`, `UpgradeNotProposed = 14`,
+`UpgradeDelayNotElapsed = 15`, `TooManyReportersPerAsset = 16`.
 Causes, remedies and the order they are checked in: [ERRORS.md](ERRORS.md#ledgererror).
 
 ### Upgrading a v0.1 deployment
@@ -331,6 +371,12 @@ The v0.1 ledger stored one report per tier under `Report(sac, tier)`. The
 live testnet ledger holds such entries, and the deployed vaults store the
 ledger's address in their config with no way to change it, so the ledger is
 upgraded in place rather than redeployed.
+
+Upgrade `reporter-registry` before `coverage-ledger`. The ledger asks the
+registry for `max_reporters` when a reporter posts for an asset for the first
+time, so a ledger running ahead of its registry would fail those calls with a
+host error for the missing function. The registry first is safe: it keeps
+`role_of`, and until an admin sets a cap it answers the default.
 
 The deployed v0.1 code predates time locks and still exposes the old immediate
 `upgrade(wasm_hash)`. Use it once to install this version:
@@ -411,6 +457,8 @@ vault call can surface: [ERRORS.md](ERRORS.md#vaulterror).
 | Auditor publishes attestation | `coverage-ledger.post_reserve` (auditor) |
 | Volunteer copies a figure from a PDF report | `coverage-ledger.post_reserve` (transcriber) |
 | Maintainer onboards an auditor / transcriber / poster | `reporter-registry.set_reporter` |
+| Maintainer onboards several reporters at once | `reporter-registry.batch_register` |
+| Maintainer caps how many reporters an asset may hold | `reporter-registry.set_max_reporters` |
 | Maintainer removes a bad actor | `reporter-registry.revoke` (their reports stop counting at once) |
 | Dashboard shows ratio and freshness | `coverage-ledger.coverage`, `get_supply`, `get_reports` |
 | Lending pool refuses an under-backed asset | `coverage-ledger.is_covered` (see `covered-vault`) |

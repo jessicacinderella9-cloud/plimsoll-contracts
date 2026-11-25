@@ -24,9 +24,11 @@ one that comes back. In practice:
   Stellar Asset Contract (SAC). If the transfer fails, the caller sees the
   **SAC's** error code, not a vault code. See
   [Errors from the asset contract](#errors-from-the-asset-contract).
-- `coverage-ledger` calls `reporter-registry.role_of` and the SAC's `name`,
-  but neither can fail on a valid deployment, so a ledger call only ever
-  fails with a ledger code.
+- `coverage-ledger` calls `reporter-registry.role_of`,
+  `reporter-registry.max_reporters` and the SAC's `name`, but none of them can
+  fail on a valid deployment, so a ledger call only ever fails with a ledger
+  code. (A ledger upgraded ahead of its registry is not a valid deployment:
+  see [SPEC.md](SPEC.md#upgrading-a-v01-deployment).)
 - `coverage-ledger.is_covered` and `coverage` never fail. Every reason an
   asset might not qualify comes back as `false` or `None`.
 
@@ -52,8 +54,8 @@ codes as literal numbers, so a renumbering fails CI.
 | 2 | [`InvalidName`](#2-invalidname) | [`AlreadyListed`](#2-alreadylisted) | [`NotCovered`](#2-notcovered) |
 | 3 | | [`AssetNotListed`](#3-assetnotlisted) | [`InsufficientBalance`](#3-insufficientbalance) |
 | 4 | | [`NotSupplyPoster`](#4-notsupplyposter) | |
-| 5 | | [`NotReporter`](#5-notreporter) | |
-| 6 | | [`InvalidAmount`](#6-invalidamount) | |
+| 5 | [`InvalidMaxReporters`](#5-invalidmaxreporters) | [`NotReporter`](#5-notreporter) | |
+| 6 | [`EmptyBatch`](#6-emptybatch) | [`InvalidAmount`](#6-invalidamount) | |
 | 7 | | [`FutureLedger`](#7-futureledger) | |
 | 8 | | [`StaleLedger`](#8-staleledger) | |
 | 9 | | [`FutureTimestamp`](#9-futuretimestamp) | |
@@ -61,11 +63,14 @@ codes as literal numbers, so a renumbering fails CI.
 | 11 | | [`InvalidUri`](#11-invaliduri) | |
 | 12 | | [`ImplausibleAmount`](#12-implausibleamount) | |
 | 13 | | [`TooManyReporters`](#13-toomanyreporters) | |
+| 14 | | `UpgradeNotProposed` | |
+| 15 | | `UpgradeDelayNotElapsed` | |
+| 16 | | [`TooManyReportersPerAsset`](#16-toomanyreportersperasset) | |
 
 ## RegistryError
 
-Raised by `reporter-registry`. Both functions that can fail are admin-only,
-so these errors reach maintainers rather than end users.
+Raised by `reporter-registry`. Every function that can fail is admin-only, so
+these errors reach maintainers rather than end users.
 
 ### 1 `ReporterNotFound`
 
@@ -78,11 +83,31 @@ so these errors reach maintainers rather than end users.
 
 ### 2 `InvalidName`
 
-- **Raised by:** `set_reporter(reporter, role, name)`.
+- **Raised by:** `set_reporter(reporter, role, name)`,
+  `batch_register(reporters)`.
 - **Cause:** `name` is empty or longer than 64 bytes. The limit is in UTF-8
   bytes, not characters, so a 30-character name in a non-Latin script can
   exceed it.
-- **Remedy:** Use a short, non-empty display name of 1 to 64 bytes.
+- **Remedy:** Use a short, non-empty display name of 1 to 64 bytes. In a batch
+  one bad name fails the whole call and nothing is written; the entry that
+  caused it is the one to fix.
+
+### 5 `InvalidMaxReporters`
+
+- **Raised by:** `set_max_reporters(max)`.
+- **Cause:** `max` is zero, which would stop every asset taking a new reporter.
+- **Remedy:** Set at least 1. The default is 20, and the per-tier caps allow at
+  most twelve distinct reporters per asset, so a value of 12 or more only
+  starts to bind if a tier cap is raised later.
+
+### 6 `EmptyBatch`
+
+- **Raised by:** `batch_register(reporters)`.
+- **Cause:** the list is empty, so the call would do nothing. It is refused
+  rather than succeeding silently, because an empty list is usually a bug in
+  the caller that built it.
+- **Remedy:** Pass at least one entry. A single reporter can also go through
+  `set_reporter`.
 
 ## LedgerError
 
@@ -93,7 +118,7 @@ when several apply the caller sees the first:
 | --- | --- |
 | `list_asset` | `NotAStellarAsset` (not a SAC), `AlreadyListed`, `NotAStellarAsset` (SAC name has no issuer) |
 | `post_supply` | auth, `NotSupplyPoster`, `AssetNotListed`, `InvalidAmount`, `FutureLedger`, `StaleLedger` |
-| `post_reserve` | auth, `AssetNotListed`, `NotReporter`, `InvalidAmount`, `InvalidUri`, `FutureTimestamp`, `ImplausibleAmount`, `StaleReport`, `TooManyReporters` |
+| `post_reserve` | auth, `AssetNotListed`, `NotReporter`, `InvalidAmount`, `InvalidUri`, `FutureTimestamp`, `ImplausibleAmount`, `StaleReport`, `TooManyReporters`, `TooManyReportersPerAsset` |
 
 ### 1 `NotAStellarAsset`
 
@@ -224,6 +249,23 @@ when several apply the caller sees the first:
   reporter needs a maintainer to revoke one of the four with
   `reporter-registry.revoke`. Their slot is reclaimed by the next
   `post_reserve` at that tier.
+
+### 16 `TooManyReportersPerAsset`
+
+- **Raised by:** `post_reserve`.
+- **Cause:** the asset already holds reports from
+  `reporter-registry.max_reporters()` distinct reporters, and this reporter
+  has no report for it at any tier. The default is 20. Before failing, the
+  ledger drops the entries of reporters who no longer count (revoked, or
+  moved to another role) at every tier, so this error means the cap is full
+  of reporters that still count. The asset's issuer occupies a slot like
+  anyone else, and a v0.1 report counts until its tier is migrated.
+- **Remedy:** A reporter already speaking for the asset can keep posting new
+  figures. A new reporter needs a maintainer to revoke one of the reporters
+  holding a slot, or to raise the cap with
+  `reporter-registry.set_max_reporters(n)`. With the default cap this error is
+  unreachable, because the per-tier caps allow at most twelve reporters per
+  asset and `TooManyReporters` is checked first.
 
 ## VaultError
 
