@@ -64,6 +64,11 @@ codes as literal numbers, so a renumbering fails CI.
 | 4 | | [`NotSupplyPoster`](#4-notsupplyposter) | |
 | 5 | [`InvalidMaxReporters`](#5-invalidmaxreporters) | [`NotReporter`](#5-notreporter) | |
 | 6 | [`EmptyBatch`](#6-emptybatch) | [`InvalidAmount`](#6-invalidamount) | |
+
+| 3 | `UpgradeNotProposed` | [`AssetNotListed`](#3-assetnotlisted) | [`InsufficientBalance`](#3-insufficientbalance) |
+| 4 | `UpgradeDelayNotElapsed` | [`NotSupplyPoster`](#4-notsupplyposter) | |
+| 5 | [`InvalidMetadata`](#5-invalidmetadata) | [`NotReporter`](#5-notreporter) | |
+| 6 | | [`InvalidAmount`](#6-invalidamount) | |
 | 7 | | [`FutureLedger`](#7-futureledger) | |
 | 8 | | [`StaleLedger`](#8-staleledger) | |
 | 9 | | [`FutureTimestamp`](#9-futuretimestamp) | |
@@ -81,6 +86,10 @@ codes as literal numbers, so a renumbering fails CI.
 
 Raised by `reporter-registry`. Every function that can fail is admin-only, so
 these errors reach maintainers rather than end users.
+
+Raised by `reporter-registry`. The role and upgrade errors are admin-only, so
+they reach maintainers rather than end users; `InvalidMetadata` is raised to a
+registered reporter updating their own entry.
 
 ### 1 `ReporterNotFound`
 
@@ -117,6 +126,16 @@ these errors reach maintainers rather than end users.
   the caller that built it.
 - **Remedy:** Pass at least one entry. A single reporter can also go through
   `set_reporter`.
+
+### 5 `InvalidMetadata`
+
+- **Raised by:** `update_reporter_metadata(reporter, name, website_uri,
+  contact_hash)`.
+- **Cause:** `Some(website_uri)` is empty or longer than 256 bytes, or
+  `Some(contact_hash)` is empty or longer than 64 bytes. A `None` field is not
+  an error; it clears that field.
+- **Remedy:** Shorten the URL or omit those fields. The `name` field is a
+  `Symbol` and is already limited to 32 bytes by the host.
 
 ## LedgerError
 
