@@ -1,7 +1,7 @@
 extern crate std;
 
 use super::*;
-use coverage_ledger::{CoverageLedger, CoverageLedgerClient as LedgerClient};
+use coverage_ledger::{CoverageLedger, CoverageLedgerClient as LedgerClient, LedgerError};
 use plimsoll_types::Role;
 use reporter_registry::{ReporterRegistry, ReporterRegistryClient};
 use soroban_sdk::{
@@ -261,5 +261,19 @@ fn can_deposit_uses_the_stored_min_tier() {
     assert_eq!(
         f.vault.try_deposit(&f.user, &UNIT),
         Err(Ok(VaultError::NotCovered.into()))
+    );
+}
+
+#[test]
+fn deposit_propagates_a_paused_ledger() {
+    let f = setup();
+    report(&f, 1_000 * UNIT, 1_000 * UNIT);
+    f.ledger.pause();
+
+    // A pause is not an under-backed asset: the ledger's Paused error reaches
+    // the depositor unchanged.
+    assert_eq!(
+        f.vault.try_deposit(&f.user, &UNIT),
+        Err(Ok(LedgerError::Paused.into()))
     );
 }
