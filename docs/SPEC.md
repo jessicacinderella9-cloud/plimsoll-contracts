@@ -394,8 +394,8 @@ Errors (`LedgerError`): `NotAStellarAsset = 1`, `AlreadyListed = 2`,
 `InvalidAmount = 6`, `FutureLedger = 7`, `StaleLedger = 8`,
 `FutureTimestamp = 9`, `StaleReport = 10`, `InvalidUri = 11`,
 `ImplausibleAmount = 12`, `TooManyReporters = 13`, `UpgradeNotProposed = 14`,
-`UpgradeDelayNotElapsed = 15`, `TooManyReportersPerAsset = 16`.
-`UpgradeDelayNotElapsed = 15`, `SelfAlias = 16`, `Paused = 17`.Causes, remedies and the order they are checked in: [ERRORS.md](ERRORS.md#ledgererror).
+`UpgradeDelayNotElapsed = 15`, `SelfAlias = 16`, `Paused = 17`, `TooManyReportersPerAsset = 18`.
+Causes, remedies and the order they are checked in: [ERRORS.md](ERRORS.md#ledgererror).
 
 ### Emergency pause
 

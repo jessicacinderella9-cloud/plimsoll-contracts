@@ -73,7 +73,7 @@ codes as literal numbers, so a renumbering fails CI.
 | 13 | | [`TooManyReporters`](#13-toomanyreporters) | |
 | 14 | | `UpgradeNotProposed` | |
 | 15 | | `UpgradeDelayNotElapsed` | |
-| 16 | | [`TooManyReportersPerAsset`](#16-toomanyreportersperasset) | |
+| 18 | | [`TooManyReportersPerAsset`](#18-toomanyreportersperasset) | |
 | 14 | | [`UpgradeNotProposed`](#14-upgradenotproposed) | |
 | 15 | | [`UpgradeDelayNotElapsed`](#15-upgradedelaynotelapsed) | |
 | 16 | | [`Paused`](#16-paused) | |
@@ -261,7 +261,7 @@ when several apply the caller sees the first:
   `reporter-registry.revoke`. Their slot is reclaimed by the next
   `post_reserve` at that tier.
 
-### 16 `TooManyReportersPerAsset`
+### 18 `TooManyReportersPerAsset`
 
 - **Raised by:** `post_reserve`.
 - **Cause:** the asset already holds reports from

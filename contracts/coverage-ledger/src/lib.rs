@@ -65,9 +65,10 @@ pub enum LedgerError {
     TooManyReporters = 13,
     UpgradeNotProposed = 14,
     UpgradeDelayNotElapsed = 15,
-    TooManyReportersPerAsset = 16,
+    TooManyReportersPerAsset = 18,
     SelfAlias = 16,
-    Paused = 17,}
+    Paused = 17,
+}
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
