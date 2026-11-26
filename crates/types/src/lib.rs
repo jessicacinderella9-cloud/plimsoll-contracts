@@ -89,6 +89,7 @@ pub struct ReporterEntry {
     pub reporter: Address,
     pub role: Role,
     pub name: String,
+}
 
 /// Optional public details a reporter publishes about themselves.
 ///
