@@ -29,8 +29,12 @@ one that comes back. In practice:
   fail on a valid deployment, so a ledger call only ever fails with a ledger
   code. (A ledger upgraded ahead of its registry is not a valid deployment:
   see [SPEC.md](SPEC.md#upgrading-a-v01-deployment).)
-- `coverage-ledger.is_covered` and `coverage` never fail. Every reason an
-  asset might not qualify comes back as `false` or `None`.
+- `coverage-ledger.is_covered` fails only with `Paused`, and only while an
+  admin has paused the ledger. Every other reason an asset might not qualify
+  comes back as `false`. `coverage` never fails; it returns `None`.
+- `covered-vault.deposit` propagates the ledger's `Paused` error unchanged
+  when the ledger is paused, so a pause is distinguishable from
+  `NotCovered`.
 
 ### Numbers are never reused or renumbered
 
@@ -52,25 +56,30 @@ codes as literal numbers, so a renumbering fails CI.
 | ---: | --- | --- | --- |
 | 1 | [`ReporterNotFound`](#1-reporternotfound) | [`NotAStellarAsset`](#1-notastellarasset) | [`InvalidAmount`](#1-invalidamount) |
 | 2 | [`InvalidName`](#2-invalidname) | [`AlreadyListed`](#2-alreadylisted) | [`NotCovered`](#2-notcovered) |
-| 3 | | [`AssetNotListed`](#3-assetnotlisted) | [`InsufficientBalance`](#3-insufficientbalance) |
-| 4 | | [`NotSupplyPoster`](#4-notsupplyposter) | |
-| 5 | [`InvalidMaxReporters`](#5-invalidmaxreporters) | [`NotReporter`](#5-notreporter) | |
-| 6 | [`EmptyBatch`](#6-emptybatch) | [`InvalidAmount`](#6-invalidamount) | |
-| 7 | | [`FutureLedger`](#7-futureledger) | |
-| 8 | | [`StaleLedger`](#8-staleledger) | |
-| 9 | | [`FutureTimestamp`](#9-futuretimestamp) | |
+| 3 | `UpgradeNotProposed` | [`AssetNotListed`](#3-assetnotlisted) | [`InsufficientBalance`](#3-insufficientbalance) |
+| 4 | `UpgradeDelayNotElapsed` | [`NotSupplyPoster`](#4-notsupplyposter) | |
+| 5 | [`InvalidMetadata`](#5-invalidmetadata) | [`NotReporter`](#5-notreporter) | |
+| 6 | [`InvalidStakeAmount`](#6-invalidstakeamount) | [`InvalidAmount`](#6-invalidamount) | |
+| 7 | [`InsufficientStake`](#7-insufficientstake) | [`FutureLedger`](#7-futureledger) | |
+| 8 | [`InvalidMaxReporters`](#8-invalidmaxreporters) | [`StaleLedger`](#8-staleledger) | |
+| 9 | [`EmptyBatch`](#9-emptybatch) | [`FutureTimestamp`](#9-futuretimestamp) | |
 | 10 | | [`StaleReport`](#10-stalereport) | |
 | 11 | | [`InvalidUri`](#11-invaliduri) | |
 | 12 | | [`ImplausibleAmount`](#12-implausibleamount) | |
 | 13 | | [`TooManyReporters`](#13-toomanyreporters) | |
-| 14 | | `UpgradeNotProposed` | |
-| 15 | | `UpgradeDelayNotElapsed` | |
-| 16 | | [`TooManyReportersPerAsset`](#16-toomanyreportersperasset) | |
+| 14 | | [`UpgradeNotProposed`](#14-upgradenotproposed) | |
+| 15 | | [`UpgradeDelayNotElapsed`](#15-upgradedelaynotelapsed) | |
+| 16 | | [`SelfAlias`](#16-selfalias) | |
+| 17 | | [`Paused`](#17-paused) | |
+| 18 | | [`LedgerTooOld`](#18-ledgertooold) | |
+| 19 | | [`NoReportToRetract`](#19-noreporttoretract) | |
+| 20 | | [`TooManyReportersPerAsset`](#20-toomanyreportersperasset) | |
 
 ## RegistryError
 
-Raised by `reporter-registry`. Every function that can fail is admin-only, so
-these errors reach maintainers rather than end users.
+Raised by `reporter-registry`. The role, upgrade, stake, cap and batch errors
+are admin-only, so they reach maintainers rather than end users;
+`InvalidMetadata` is raised to a registered reporter updating their own entry.
 
 ### 1 `ReporterNotFound`
 
@@ -92,14 +101,38 @@ these errors reach maintainers rather than end users.
   one bad name fails the whole call and nothing is written; the entry that
   caused it is the one to fix.
 
-### 5 `InvalidMaxReporters`
+### 5 `InvalidMetadata`
+
+- **Raised by:** `update_reporter_metadata(reporter, name, website_uri,
+  contact_hash)`.
+- **Cause:** `Some(website_uri)` is empty or longer than 256 bytes, or
+  `Some(contact_hash)` is empty or longer than 64 bytes. A `None` field is not
+  an error; it clears that field.
+- **Remedy:** Shorten the URL or omit those fields. The `name` field is a
+  `Symbol` and is already limited to 32 bytes by the host.
+
+### 6 `InvalidStakeAmount`
+
+- **Raised by:** `top_up_stake(reporter, amount)`, `reduce_stake(reporter, amount)`.
+- **Cause:** `amount` is zero or negative, or adding `amount` to the existing
+  stake would overflow `i128`.
+- **Remedy:** Pass a strictly positive `amount` within `i128` bounds.
+
+### 7 `InsufficientStake`
+
+- **Raised by:** `reduce_stake(reporter, amount)`.
+- **Cause:** `amount` exceeds the reporter's currently tracked stake (`stake_of`).
+- **Remedy:** Query `stake_of(reporter)` and reduce by at most that amount.
+
+### 8 `InvalidMaxReporters`
 
 - **Raised by:** `set_max_reporters(max)`.
-- **Cause:** `max` is zero, which would stop every asset taking a new reporter.
+- **Cause:** `max` is zero, which would stop every asset taking a new
+  reporter.
 - **Remedy:** Set at least 1. The default is 20, above what the per-tier caps
   allow, so a value only changes anything when the admin lowers it.
 
-### 6 `EmptyBatch`
+### 9 `EmptyBatch`
 
 - **Raised by:** `batch_register(reporters)`.
 - **Cause:** the list is empty, so the call would do nothing. It is refused
@@ -116,8 +149,10 @@ when several apply the caller sees the first:
 | Function | Order checked |
 | --- | --- |
 | `list_asset` | `NotAStellarAsset` (not a SAC), `AlreadyListed`, `NotAStellarAsset` (SAC name has no issuer) |
-| `post_supply` | auth, `NotSupplyPoster`, `AssetNotListed`, `InvalidAmount`, `FutureLedger`, `StaleLedger` |
-| `post_reserve` | auth, `AssetNotListed`, `NotReporter`, `InvalidAmount`, `InvalidUri`, `FutureTimestamp`, `ImplausibleAmount`, `StaleReport`, `TooManyReporters`, `TooManyReportersPerAsset` |
+| `post_supply` | auth, `Paused`, `NotSupplyPoster`, `AssetNotListed`, `InvalidAmount`, `FutureLedger`, `LedgerTooOld`, `StaleLedger` |
+| `post_reserve` | auth, `Paused`, `AssetNotListed`, `NotReporter`, `InvalidAmount`, `InvalidUri`, `FutureTimestamp`, `ImplausibleAmount`, `StaleReport`, `TooManyReporters`, `TooManyReportersPerAsset` |
+| `retract_reserve` | auth, `AssetNotListed`, `NotReporter`, `NoReportToRetract` |
+| `enable_native_supply` | auth, `AssetNotListed` |
 
 ### 1 `NotAStellarAsset`
 
@@ -249,7 +284,57 @@ when several apply the caller sees the first:
   `reporter-registry.revoke`. Their slot is reclaimed by the next
   `post_reserve` at that tier.
 
-### 16 `TooManyReportersPerAsset`
+### 14 `UpgradeNotProposed`
+
+- **Raised by:** `execute_upgrade`, `cancel_upgrade`.
+- **Cause:** Nothing is awaiting execution. The proposal was never made, was
+  already executed, or was cancelled. A new proposal also replaces the old
+  one, so only the latest hash is ever pending.
+- **Remedy:** Read `pending_upgrade()`. If it is `None`, call
+  `propose_upgrade(wasm_hash)` and wait `UPGRADE_DELAY_LEDGERS` before
+  executing.
+
+### 15 `UpgradeDelayNotElapsed`
+
+- **Raised by:** `execute_upgrade`.
+- **Cause:** The pending proposal's `executable_at_ledger` has not been
+  reached yet. The delay is `UPGRADE_DELAY_LEDGERS` ledgers from the proposal.
+- **Remedy:** Wait until the current ledger sequence is at least
+  `pending_upgrade().executable_at_ledger`, then execute. Watching
+  `upgrade_proposed` is the intended signal to raise an alarm before that
+  ledger closes.
+
+### 17 `Paused`
+
+- **Raised by:** `post_supply`, `post_reserve`, `is_covered`.
+- **Cause:** An admin called `pause()` and has not called `unpause()` yet.
+  Pausing stops new figures from being recorded and stops `is_covered` from
+  answering, so a consumer never reads a pause as an under-backed asset.
+- **Remedy:** Nothing is wrong with the caller's request. Wait for the admin
+  to `unpause()`, or read `is_paused()` and `coverage_status(...)` first and
+  show the paused state in the UI. `coverage`, `get_supply`, `get_reports`
+  and `coverage_status` keep working while paused.
+
+### 18 `LedgerTooOld`
+
+- **Raised by:** `post_supply(poster, sac, amount, ledger, breakdown_hash)`.
+- **Cause:** `ledger` is more than 720 ledgers behind the current ledger
+  (approximately one hour at Stellar's usual five-second ledger cadence).
+  `post_supply` stores the submission time, so without this sequence bound an
+  old figure could be presented as a fresh snapshot.
+- **Remedy:** Recompute supply from a recent ledger and post its sequence.
+  Exactly 720 ledgers of lag is accepted.
+
+### 19 `NoReportToRetract`
+
+- **Raised by:** `retract_reserve(reporter, sac)`.
+- **Cause:** The authorised reporter has no stored report for the tier their
+  identity currently resolves to. This includes signing with a different
+  reporter address, even when another reporter has a report at that tier.
+- **Remedy:** Sign with the address that posted the report, and confirm the
+  report still exists at the reporter's current tier.
+
+### 20 `TooManyReportersPerAsset`
 
 - **Raised by:** `post_reserve`.
 - **Cause:** the asset already holds reports from
@@ -289,8 +374,10 @@ users meet most.
   - The chosen report's `as_of` is more than `max_age` seconds ago.
   - Coverage is below `min_bps`.
 - **Remedy:** Users should wait. The asset will be accepted again once fresh
-  figures show it is covered, and withdrawals are never blocked. Front ends
-  should call `can_deposit()` before offering a deposit, and to explain the
+  figures show it is covered, and withdrawals are never blocked. A paused
+  ledger raises `Paused` from `deposit` instead of `NotCovered`, so check
+  `coverage-ledger.is_paused()` to tell the two apart. Front ends should call
+  `can_deposit()` before offering a deposit, and to explain the
   refusal, read `config()` and then
   `coverage-ledger.coverage(asset, min_tier)`:
   - `None` means a figure is missing.

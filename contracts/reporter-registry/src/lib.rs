@@ -3,22 +3,26 @@
 #![no_std]
 
 use plimsoll_types::{
-    PendingUpgrade, ReporterEntry, ReporterInfo, Role, DEFAULT_MAX_REPORTERS_PER_ASSET,
-    INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD, PERSISTENT_EXTEND_TO, PERSISTENT_THRESHOLD,
-    UPGRADE_DELAY_LEDGERS,
+    PendingUpgrade, ReporterEntry, ReporterInfo, ReporterMetadata, Role,
+    DEFAULT_MAX_REPORTERS_PER_ASSET, INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD, PERSISTENT_EXTEND_TO,
+    PERSISTENT_THRESHOLD, UPGRADE_DELAY_LEDGERS,
 };
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
-    BytesN, ContractExecutable, Env, String, Vec,
+    Bytes, BytesN, ContractExecutable, Env, String, Symbol, Vec,
 };
 
 const MAX_NAME_LEN: u32 = 64;
+const MAX_WEBSITE_URI_LEN: u32 = 256;
+const MAX_CONTACT_HASH_LEN: u32 = 64;
 
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Admin,
     Reporter(Address),
+    Metadata(Address),
+    Stake(Address),
     PendingUpgrade,
     MaxReporters,
 }
@@ -31,8 +35,11 @@ pub enum RegistryError {
     InvalidName = 2,
     UpgradeNotProposed = 3,
     UpgradeDelayNotElapsed = 4,
-    InvalidMaxReporters = 5,
-    EmptyBatch = 6,
+    InvalidMetadata = 5,
+    InvalidStakeAmount = 6,
+    InsufficientStake = 7,
+    InvalidMaxReporters = 8,
+    EmptyBatch = 9,
 }
 
 #[contractevent]
@@ -46,9 +53,28 @@ pub struct ReporterSet {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReporterMetadataUpdated {
+    #[topic]
+    pub reporter: Address,
+    pub name: Option<Symbol>,
+    pub website_uri: Option<String>,
+    pub contact_hash: Option<Bytes>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReporterRevoked {
     #[topic]
     pub reporter: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakeChanged {
+    #[topic]
+    pub reporter: Address,
+    pub old_stake: i128,
+    pub new_stake: i128,
 }
 
 #[contractevent]
@@ -115,6 +141,46 @@ fn configured_max_reporters(env: &Env) -> u32 {
         .instance()
         .get(&DataKey::MaxReporters)
         .unwrap_or(DEFAULT_MAX_REPORTERS_PER_ASSET)
+}
+
+fn require_registered(env: &Env, reporter: &Address) {
+    if !env
+        .storage()
+        .persistent()
+        .has(&DataKey::Reporter(reporter.clone()))
+    {
+        panic_with_error!(env, RegistryError::ReporterNotFound);
+    }
+}
+
+fn read_stake(env: &Env, reporter: &Address) -> i128 {
+    let key = DataKey::Stake(reporter.clone());
+    let stake = env.storage().persistent().get::<_, i128>(&key);
+    if stake.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_EXTEND_TO);
+    }
+    stake.unwrap_or(0)
+}
+
+fn write_stake(env: &Env, reporter: &Address, old_stake: i128, new_stake: i128) {
+    let key = DataKey::Stake(reporter.clone());
+    if new_stake == 0 {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &new_stake);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_EXTEND_TO);
+    }
+    bump_instance(env);
+    StakeChanged {
+        reporter: reporter.clone(),
+        old_stake,
+        new_stake,
+    }
+    .publish(env);
 }
 
 fn require_valid_name(env: &Env, name: &String) {
@@ -194,13 +260,123 @@ impl ReporterRegistry {
 
     pub fn revoke(env: Env, reporter: Address) {
         admin(&env).require_auth();
-        let key = DataKey::Reporter(reporter.clone());
-        if !env.storage().persistent().has(&key) {
-            panic_with_error!(&env, RegistryError::ReporterNotFound);
+        require_registered(&env, &reporter);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Reporter(reporter.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Metadata(reporter.clone()));
+        let stake_key = DataKey::Stake(reporter.clone());
+        if let Some(old_stake) = env.storage().persistent().get::<_, i128>(&stake_key) {
+            env.storage().persistent().remove(&stake_key);
+            if old_stake > 0 {
+                StakeChanged {
+                    reporter: reporter.clone(),
+                    old_stake,
+                    new_stake: 0,
+                }
+                .publish(&env);
+            }
         }
-        env.storage().persistent().remove(&key);
         bump_instance(&env);
         ReporterRevoked { reporter }.publish(&env);
+    }
+
+    /// Top up a registered reporter's tracked stake by `amount`.
+    pub fn top_up_stake(env: Env, reporter: Address, amount: i128) -> i128 {
+        admin(&env).require_auth();
+        require_registered(&env, &reporter);
+        if amount <= 0 {
+            panic_with_error!(&env, RegistryError::InvalidStakeAmount);
+        }
+        let old_stake = read_stake(&env, &reporter);
+        let new_stake = old_stake
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::InvalidStakeAmount));
+        write_stake(&env, &reporter, old_stake, new_stake);
+        new_stake
+    }
+
+    /// Reduce a registered reporter's tracked stake by `amount`.
+    pub fn reduce_stake(env: Env, reporter: Address, amount: i128) -> i128 {
+        admin(&env).require_auth();
+        require_registered(&env, &reporter);
+        if amount <= 0 {
+            panic_with_error!(&env, RegistryError::InvalidStakeAmount);
+        }
+        let old_stake = read_stake(&env, &reporter);
+        if amount > old_stake {
+            panic_with_error!(&env, RegistryError::InsufficientStake);
+        }
+        let new_stake = old_stake - amount;
+        write_stake(&env, &reporter, old_stake, new_stake);
+        new_stake
+    }
+
+    /// A reporter's tracked stake, or `0` when none is recorded.
+    pub fn stake_of(env: Env, reporter: Address) -> i128 {
+        read_stake(&env, &reporter)
+    }
+
+    /// Replace a registered reporter's optional public metadata. The reporter
+    /// authorises the change; an admin cannot edit it on their behalf. A `None`
+    /// field clears that field, and clearing all three removes the entry.
+    pub fn update_reporter_metadata(
+        env: Env,
+        reporter: Address,
+        name: Option<Symbol>,
+        website_uri: Option<String>,
+        contact_hash: Option<Bytes>,
+    ) {
+        reporter.require_auth();
+        require_registered(&env, &reporter);
+        if let Some(uri) = website_uri.as_ref() {
+            if uri.is_empty() || uri.len() > MAX_WEBSITE_URI_LEN {
+                panic_with_error!(&env, RegistryError::InvalidMetadata);
+            }
+        }
+        if let Some(hash) = contact_hash.as_ref() {
+            if hash.is_empty() || hash.len() > MAX_CONTACT_HASH_LEN {
+                panic_with_error!(&env, RegistryError::InvalidMetadata);
+            }
+        }
+
+        let key = DataKey::Metadata(reporter.clone());
+        if name.is_none() && website_uri.is_none() && contact_hash.is_none() {
+            env.storage().persistent().remove(&key);
+        } else {
+            let metadata = ReporterMetadata {
+                name: name.clone(),
+                website_uri: website_uri.clone(),
+                contact_hash: contact_hash.clone(),
+            };
+            env.storage().persistent().set(&key, &metadata);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_EXTEND_TO);
+        }
+        bump_instance(&env);
+        ReporterMetadataUpdated {
+            reporter,
+            name,
+            website_uri,
+            contact_hash,
+        }
+        .publish(&env);
+    }
+
+    /// A reporter's optional metadata, or `None` when they have published
+    /// none. Reading an existing entry extends its TTL like `get_reporter`.
+    pub fn get_reporter_metadata(env: Env, reporter: Address) -> Option<ReporterMetadata> {
+        let key = DataKey::Metadata(reporter);
+        let metadata = env.storage().persistent().get::<_, ReporterMetadata>(&key);
+        if metadata.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_EXTEND_TO);
+        }
+        metadata
     }
 
     pub fn role_of(env: Env, reporter: Address) -> Option<Role> {

@@ -4,9 +4,10 @@
 #![no_std]
 
 use plimsoll_types::{
-    coverage_bps, AssetRecord, Coverage, PendingUpgrade, RegistryClient, ReserveReport, Role,
-    SupplySnapshot, Tier, INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD, MAX_PLAUSIBLE_BPS,
-    MIN_PLAUSIBLE_BPS, PERSISTENT_EXTEND_TO, PERSISTENT_THRESHOLD, UPGRADE_DELAY_LEDGERS,
+    coverage_bps, AssetRecord, Coverage, CoverageStatus, CoveredInfo, PendingUpgrade,
+    RegistryClient, ReserveReport, Role, StaleInfo, SupplySnapshot, SupplyTokenClient, Tier,
+    INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD, MAX_PLAUSIBLE_BPS, MIN_PLAUSIBLE_BPS,
+    PERSISTENT_EXTEND_TO, PERSISTENT_THRESHOLD, SECONDS_PER_LEDGER, UPGRADE_DELAY_LEDGERS,
 };
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
@@ -22,6 +23,12 @@ const MAX_CODE_LEN: usize = 12;
 /// Most reporters whose figures one asset keeps at one tier. Bounds what
 /// `coverage` reads, and so what every `is_covered` caller pays.
 pub const MAX_REPORTERS_PER_TIER: u32 = 4;
+/// At Stellar's usual five-second ledger cadence, bounds supply snapshots to
+/// approximately one hour of age.
+pub const MAX_SUPPLY_LEDGER_AGE: u32 = 720;
+
+/// Most asset-reporter pairs one `asset_reporter_pairs` call returns.
+pub const MAX_PAIRS_PER_CALL: u32 = 50;
 
 #[contracttype]
 #[derive(Clone)]
@@ -37,6 +44,14 @@ enum DataKey {
     ReportBy(Address, Tier, Address),
     /// Reporters with a `ReportBy` entry at (sac, tier), in first-post order.
     Reporters(Address, Tier),
+    /// Incident switch. Absent means not paused.
+    Paused,
+    /// The SEP-41 token whose `total_supply()` replaces the posted snapshot.
+    NativeSupply(Address),
+    /// Maps a deprecated asset SAC to its successor SAC (at most one hop).
+    Alias(Address),
+    /// Index of all listed asset SACs, in listing order.
+    Assets,
 }
 
 #[contracterror]
@@ -58,7 +73,11 @@ pub enum LedgerError {
     TooManyReporters = 13,
     UpgradeNotProposed = 14,
     UpgradeDelayNotElapsed = 15,
-    TooManyReportersPerAsset = 16,
+    SelfAlias = 16,
+    Paused = 17,
+    LedgerTooOld = 18,
+    NoReportToRetract = 19,
+    TooManyReportersPerAsset = 20,
 }
 
 #[contractevent]
@@ -97,9 +116,40 @@ pub struct ReservePosted {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveRetracted {
+    #[topic]
+    pub sac: Address,
+    #[topic]
+    pub tier: Tier,
+    pub reporter: Address,
+    pub as_of: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminTransferred {
     #[topic]
     pub new_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSupplyEnabled {
+    #[topic]
+    pub sac: Address,
+    pub token: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Paused {
+    pub by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Unpaused {
+    pub by: Address,
 }
 
 #[contractevent]
@@ -122,6 +172,15 @@ pub struct UpgradeExecuted {
 pub struct UpgradeCancelled {
     #[topic]
     pub wasm_hash: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetAliased {
+    #[topic]
+    pub old: Address,
+    #[topic]
+    pub new: Address,
 }
 
 #[contract]
@@ -149,6 +208,22 @@ fn bump_instance(env: &Env) {
 
 fn pending(env: &Env) -> Option<PendingUpgrade> {
     env.storage().instance().get(&DataKey::PendingUpgrade)
+}
+
+fn paused_flag(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+/// Stop a write at the door while the incident switch is on. Checked after
+/// authentication and before every other write error, so the pause is the
+/// reason callers see.
+fn require_not_paused(env: &Env) {
+    if paused_flag(env) {
+        panic_with_error!(env, LedgerError::Paused);
+    }
 }
 
 fn read_persistent<V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
@@ -182,6 +257,17 @@ fn require_listed(env: &Env, sac: &Address) -> AssetRecord {
     }
 }
 
+/// Check that `sac` is listed without deserialising its `AssetRecord`.
+fn ensure_listed(env: &Env, sac: &Address) {
+    let key = DataKey::Asset(sac.clone());
+    if !env.storage().persistent().has(&key) {
+        panic_with_error!(env, LedgerError::AssetNotListed);
+    }
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_EXTEND_TO);
+}
+
 /// Split a Stellar Asset Contract name (`CODE:GISSUER...`) into code and
 /// issuer. Returns `None` for `native` or anything malformed.
 fn parse_sac_name(env: &Env, name: &String) -> Option<(String, Address)> {
@@ -202,6 +288,10 @@ fn parse_sac_name(env: &Env, name: &String) -> Option<(String, Address)> {
 
 fn reporters(env: &Env, sac: &Address, tier: Tier) -> Vec<Address> {
     read_persistent(env, &DataKey::Reporters(sac.clone(), tier)).unwrap_or_else(|| Vec::new(env))
+}
+
+fn assets(env: &Env) -> Vec<Address> {
+    read_persistent(env, &DataKey::Assets).unwrap_or_else(|| Vec::new(env))
 }
 
 /// Every stored report at `tier`: a not-yet-migrated v0.1 entry first, then
@@ -248,38 +338,107 @@ fn migrate_legacy(env: &Env, sac: &Address, tier: Tier) {
     }
 }
 
+/// The supply figure coverage is judged against, from either the native source
+/// or the posted snapshot.
+struct SupplyFigure {
+    amount: i128,
+    ledger: u32,
+    timestamp: u64,
+}
+
+/// The token opted in to as this asset's native supply source, if any.
+fn native_token(env: &Env, sac: &Address) -> Option<Address> {
+    read_persistent(env, &DataKey::NativeSupply(sac.clone()))
+}
+
+/// The native figure, or `None` when the opt-in is absent or the call fails.
+/// A failure is not an error: callers fall back to the posted snapshot.
+fn native_supply(env: &Env, sac: &Address) -> Option<SupplyFigure> {
+    let token = native_token(env, sac)?;
+    match SupplyTokenClient::new(env, &token).try_total_supply() {
+        Ok(Ok(amount)) if amount >= 0 => Some(SupplyFigure {
+            amount,
+            ledger: env.ledger().sequence(),
+            timestamp: env.ledger().timestamp(),
+        }),
+        _ => None,
+    }
+}
+
+/// Native supply when opted in and answering, otherwise the latest snapshot.
+fn effective_supply(env: &Env, sac: &Address) -> Option<SupplyFigure> {
+    if let Some(native) = native_supply(env, sac) {
+        return Some(native);
+    }
+    read_persistent::<SupplySnapshot>(env, &DataKey::Supply(sac.clone())).map(|snapshot| {
+        SupplyFigure {
+            amount: snapshot.amount,
+            ledger: snapshot.ledger,
+            timestamp: snapshot.timestamp,
+        }
+    })
+}
+
+/// Whether a reporter at `tier` still counts: issuer-signed reports always
+/// count, while auditor and transcriber reports require the matching role.
+fn counts_for_tier(registry: &RegistryClient, tier: Tier, reporter: &Address) -> bool {
+    let needed = match tier {
+        Tier::IssuerSigned => return true,
+        Tier::AuditorSigned => Role::Auditor,
+        Tier::Transcribed => Role::Transcriber,
+    };
+    registry.role_of(reporter) == Some(needed)
+}
+
 /// Whether a stored report still counts: its reporter must still be entitled
 /// to its tier. Issuer-signed reports always count; the issuer is fixed by the
 /// asset record. A revoked auditor or transcriber, or one whose role changed,
 /// no longer speaks for the figures they posted.
 fn counts(registry: &RegistryClient, report: &ReserveReport) -> bool {
-    let needed = match report.tier {
-        Tier::IssuerSigned => return true,
-        Tier::AuditorSigned => Role::Auditor,
-        Tier::Transcribed => Role::Transcriber,
-    };
-    registry.role_of(&report.reporter) == Some(needed)
+    counts_for_tier(registry, report.tier, &report.reporter)
 }
 
-/// The freshest report in `candidates` that still counts. Candidates come in
-/// priority order (strongest tier first, then first-post order), so on equal
-/// `as_of` the earlier one wins. The registry is asked only about the report
-/// that would win, and again only if that one no longer counts, so a fresh
-/// issuer-signed report costs no cross-contract call at all.
-fn pick_counting(env: &Env, mut candidates: Vec<ReserveReport>) -> Option<ReserveReport> {
+/// The freshest counting report in `candidates`.
+///
+/// Two-phase per iteration: (1) a single O(n) index scan that finds the
+/// globally freshest non-rejected candidate without touching the registry,
+/// then (2) one `counts` call. If that report is revoked the index is marked
+/// and the loop repeats. This avoids Vec::remove (O(n) element shift) and
+/// keeps registry calls at most equal to the number of revoked reporters.
+/// A bitmask tracks rejected positions; `candidates` is never mutated.
+/// We have at most 3 tiers × (1 legacy + MAX_REPORTERS_PER_TIER) = 15
+/// entries, so a u32 bitmask is always sufficient.
+fn pick_counting(env: &Env, candidates: Vec<ReserveReport>) -> Option<ReserveReport> {
     let registry = RegistryClient::new(env, &registry(env));
+    let n = candidates.len();
+    let mut skip: u32 = 0;
     loop {
-        let mut best: Option<(u32, ReserveReport)> = None;
-        for (i, report) in candidates.iter().enumerate() {
-            if best.as_ref().is_none_or(|(_, b)| report.as_of > b.as_of) {
-                best = Some((i as u32, report));
+        // Phase 1: find the freshest non-skipped candidate (no registry call).
+        let mut best_i: Option<u32> = None;
+        for i in 0..n {
+            if skip & (1u32 << i) != 0 {
+                continue;
             }
+            let r = candidates.get(i).unwrap();
+            best_i = Some(match best_i {
+                None => i,
+                Some(bi) => {
+                    let b = candidates.get(bi).unwrap();
+                    if r.as_of > b.as_of || (r.as_of == b.as_of && r.tier > b.tier) {
+                        i
+                    } else {
+                        bi
+                    }
+                }
+            });
         }
-        let (i, report) = best?;
+        // Phase 2: check only the winner.
+        let i = best_i?;
+        let report = candidates.get(i).unwrap();
         if counts(&registry, &report) {
             return Some(report);
         }
-        candidates.remove(i);
+        skip |= 1u32 << i;
     }
 }
 
@@ -347,11 +506,8 @@ fn reclaim_slots(
     let mut kept = Vec::new(env);
     for reporter in index.iter() {
         let key = DataKey::ReportBy(sac.clone(), tier, reporter.clone());
-        let keep = env
-            .storage()
-            .persistent()
-            .get::<_, ReserveReport>(&key)
-            .is_some_and(|report| counts(registry, &report));
+        let keep =
+            env.storage().persistent().has(&key) && counts_for_tier(registry, tier, &reporter);
         if keep {
             kept.push_back(reporter);
         } else {
@@ -399,6 +555,9 @@ impl CoverageLedger {
             listed_at: env.ledger().timestamp(),
         };
         write_persistent(&env, &key, &record);
+        let mut index = assets(&env);
+        index.push_back(sac.clone());
+        write_persistent(&env, &DataKey::Assets, &index);
         bump_instance(&env);
         AssetListed { sac, code, issuer }.publish(&env);
         record
@@ -414,16 +573,21 @@ impl CoverageLedger {
         breakdown_hash: BytesN<32>,
     ) {
         poster.require_auth();
+        require_not_paused(&env);
         let role = RegistryClient::new(&env, &registry(&env)).role_of(&poster);
         if role != Some(Role::SupplyPoster) {
             panic_with_error!(&env, LedgerError::NotSupplyPoster);
         }
-        require_listed(&env, &sac);
+        ensure_listed(&env, &sac);
         if amount < 0 {
             panic_with_error!(&env, LedgerError::InvalidAmount);
         }
-        if ledger > env.ledger().sequence() {
+        let current_ledger = env.ledger().sequence();
+        if ledger > current_ledger {
             panic_with_error!(&env, LedgerError::FutureLedger);
+        }
+        if current_ledger - ledger > MAX_SUPPLY_LEDGER_AGE {
+            panic_with_error!(&env, LedgerError::LedgerTooOld);
         }
         let key = DataKey::Supply(sac.clone());
         if let Some(previous) = read_persistent::<SupplySnapshot>(&env, &key) {
@@ -463,6 +627,7 @@ impl CoverageLedger {
         doc_uri: String,
     ) -> Tier {
         reporter.require_auth();
+        require_not_paused(&env);
         let asset = require_listed(&env, &sac);
         let tier = if reporter == asset.issuer {
             Tier::IssuerSigned
@@ -562,12 +727,82 @@ impl CoverageLedger {
         tier
     }
 
+    /// Remove the caller's latest reserve report at the tier their identity
+    /// resolves to, returning coverage to the next report if one exists.
+    pub fn retract_reserve(env: Env, reporter: Address, sac: Address) {
+        reporter.require_auth();
+        let asset = require_listed(&env, &sac);
+        let tier = if reporter == asset.issuer {
+            Tier::IssuerSigned
+        } else {
+            match RegistryClient::new(&env, &registry(&env)).role_of(&reporter) {
+                Some(Role::Auditor) => Tier::AuditorSigned,
+                Some(Role::Transcriber) => Tier::Transcribed,
+                _ => panic_with_error!(&env, LedgerError::NotReporter),
+            }
+        };
+
+        migrate_legacy(&env, &sac, tier);
+        let report_key = DataKey::ReportBy(sac.clone(), tier, reporter.clone());
+        let report = match read_persistent::<ReserveReport>(&env, &report_key) {
+            Some(report) if report.reporter == reporter => report,
+            _ => panic_with_error!(&env, LedgerError::NoReportToRetract),
+        };
+        let mut index = reporters(&env, &sac, tier);
+        if let Some(i) = index
+            .iter()
+            .position(|indexed| indexed == reporter)
+            .and_then(|i| u32::try_from(i).ok())
+        {
+            index.remove(i);
+        } else {
+            panic_with_error!(&env, LedgerError::NoReportToRetract);
+        }
+
+        env.storage().persistent().remove(&report_key);
+        let index_key = DataKey::Reporters(sac.clone(), tier);
+        if index.is_empty() {
+            env.storage().persistent().remove(&index_key);
+        } else {
+            write_persistent(&env, &index_key, &index);
+        }
+        bump_instance(&env);
+        ReserveRetracted {
+            sac,
+            tier,
+            reporter,
+            as_of: report.as_of,
+        }
+        .publish(&env);
+    }
+
     pub fn get_asset(env: Env, sac: Address) -> Option<AssetRecord> {
         read_persistent(&env, &DataKey::Asset(sac))
     }
 
     pub fn get_supply(env: Env, sac: Address) -> Option<SupplySnapshot> {
         read_persistent(&env, &DataKey::Supply(sac))
+    }
+
+    /// Register `new` as the successor of the deprecated asset `old`.
+    /// Both must already be listed. At most one alias hop is ever followed:
+    /// `is_covered(old, ...)` and `coverage(old, ...)` will resolve `old` to
+    /// `new`, but `new`'s own alias (if any) is ignored.
+    pub fn alias_asset(env: Env, old: Address, new: Address) {
+        admin(&env).require_auth();
+        if old == new {
+            panic_with_error!(&env, LedgerError::SelfAlias);
+        }
+        ensure_listed(&env, &old);
+        ensure_listed(&env, &new);
+        write_persistent(&env, &DataKey::Alias(old.clone()), &new);
+        bump_instance(&env);
+        AssetAliased { old, new }.publish(&env);
+    }
+
+    /// The registered successor of `asset`, if one exists.
+    pub fn get_alias(env: Env, asset: Address) -> Option<Address> {
+        read_persistent(&env, &DataKey::Alias(asset))
     }
 
     /// The freshest report at `tier` that still counts.
@@ -590,10 +825,97 @@ impl CoverageLedger {
         out
     }
 
+    /// When `reporter` most recently posted a reserve figure for `asset`: the
+    /// ledger timestamp of that post (`posted_at`), not the figure's `as_of`.
+    ///
+    /// Every tier is searched, so a reporter whose role changed answers with
+    /// whichever of their posts is later, and a not-yet-migrated v0.1 entry
+    /// counts as one of their posts too. The registry is not consulted: a
+    /// revoked reporter's posts remain history, and `get_reports` already says
+    /// which of them still count. `None` when `reporter` has never posted for
+    /// `asset`.
+    pub fn reporter_last_post(env: Env, reporter: Address, asset: Address) -> Option<u64> {
+        let mut last: Option<u64> = None;
+        let mut note = |posted_at: u64| {
+            if last.is_none_or(|seen| posted_at > seen) {
+                last = Some(posted_at);
+            }
+        };
+        for tier in Tier::ALL_DESC {
+            if let Some(legacy) =
+                read_persistent::<ReserveReport>(&env, &DataKey::Report(asset.clone(), tier))
+            {
+                if legacy.reporter == reporter {
+                    note(legacy.posted_at);
+                }
+            }
+            if let Some(report) = read_persistent::<ReserveReport>(
+                &env,
+                &DataKey::ReportBy(asset.clone(), tier, reporter.clone()),
+            ) {
+                note(report.posted_at);
+            }
+        }
+        last
+    }
+
+    /// A page of the (asset, reporter) pairs the ledger holds figures for, so
+    /// an indexer can bootstrap its dataset without walking every asset.
+    ///
+    /// Pairs come from the stored per-tier reporter indexes, so no registry
+    /// call is made: a reporter whose figure no longer counts still appears,
+    /// and `get_reports` / `reporter_last_post` say what they posted. A
+    /// reporter with an entry at more than one tier appears once per asset.
+    ///
+    /// Order: assets in listing order, and within an asset the tiers strongest
+    /// first (`AuditorSigned`, `IssuerSigned`, `Transcribed`), first-post
+    /// order within a tier. `cursor` is the index of the first pair to return
+    /// and defaults to `0`; `limit` is capped at `MAX_PAIRS_PER_CALL = 50`.
+    /// An empty page means the cursor is at or past the last pair. Listings
+    /// and first posts only ever grow the sequence, so a bootstrap that must
+    /// be exact should re-read from `0` or dedupe by pair.
+    pub fn asset_reporter_pairs(
+        env: Env,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Vec<(Address, Address)> {
+        let start = cursor.unwrap_or(0);
+        let page = limit.min(MAX_PAIRS_PER_CALL);
+        let mut out = Vec::new(&env);
+        if page == 0 {
+            return out;
+        }
+        let mut index = 0u32;
+        for asset in assets(&env).iter() {
+            let mut reported = Vec::new(&env);
+            for tier in Tier::ALL_DESC {
+                for reporter in reporters(&env, &asset, tier).iter() {
+                    if reported.contains(&reporter) {
+                        continue;
+                    }
+                    reported.push_back(reporter.clone());
+                    if index < start {
+                        index += 1;
+                        continue;
+                    }
+                    out.push_back((asset.clone(), reporter));
+                    if out.len() == page {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Latest supply against the freshest report at `min_tier` or stronger.
+    /// If `sac` has a registered alias its successor is used transparently
+    /// (at most one hop — the successor's own alias, if any, is not followed).
     pub fn coverage(env: Env, sac: Address, min_tier: Tier) -> Option<Coverage> {
-        let supply = read_persistent::<SupplySnapshot>(&env, &DataKey::Supply(sac.clone()))?;
-        let report = best_report(&env, &sac, min_tier)?;
+        let resolved = read_persistent::<Address>(&env, &DataKey::Alias(sac.clone()))
+            .unwrap_or_else(|| sac.clone());
+        let supply = effective_supply(&env, &resolved)?;
+        let report = best_report(&env, &resolved, min_tier)?;
         Some(Coverage {
             bps: coverage_bps(report.amount, supply.amount),
             supply: supply.amount,
@@ -606,15 +928,92 @@ impl CoverageLedger {
     }
 
     /// True when both the supply snapshot and the chosen report are at most
-    /// `max_age` seconds old and coverage is at least `min_bps`.
+    /// `max_age` seconds old and coverage is at least `min_bps` (inclusive).
+    ///
+    /// If `sac` has a registered alias its successor is used transparently
+    /// (at most one hop). See `alias_asset` and `get_alias`.
+    ///
+    /// Performance note: the supply snapshot is loaded first. When it is
+    /// absent or already older than `max_age` the function returns false
+    /// immediately, before reading any reserve reports. This is the common
+    /// early-exit path: a stale supply avoids all subsequent storage reads.
     pub fn is_covered(env: Env, sac: Address, min_bps: u32, max_age: u64, min_tier: Tier) -> bool {
+        match Self::coverage_status(env.clone(), sac, min_bps, max_age, min_tier) {
+            CoverageStatus::Paused => panic_with_error!(&env, LedgerError::Paused),
+            CoverageStatus::Covered(_) => true,
+            CoverageStatus::Stale(_) | CoverageStatus::Uncovered => false,
+        }
+    }
+
+    /// `coverage` with the reason attached, in one call. Precedence: paused,
+    /// then stale (the last ratio is not a verdict on backing), then
+    /// under-backed, then covered.
+    pub fn coverage_status(
+        env: Env,
+        sac: Address,
+        min_bps: u32,
+        max_age: u64,
+        min_tier: Tier,
+    ) -> CoverageStatus {
+        if paused_flag(&env) {
+            return CoverageStatus::Paused;
+        }
         let coverage = match Self::coverage(env.clone(), sac, min_tier) {
             Some(c) => c,
-            None => return false,
+            None => return CoverageStatus::Uncovered,
         };
         let now = env.ledger().timestamp();
-        let fresh = |t: u64| now.saturating_sub(t) <= max_age;
-        fresh(coverage.supply_timestamp) && fresh(coverage.report_as_of) && coverage.bps >= min_bps
+        let age = now
+            .saturating_sub(coverage.supply_timestamp)
+            .max(now.saturating_sub(coverage.report_as_of));
+        if age > max_age {
+            return CoverageStatus::Stale(StaleInfo {
+                last_bps: coverage.bps,
+                age_ledgers: (age / SECONDS_PER_LEDGER).min(u32::MAX as u64) as u32,
+            });
+        }
+        if coverage.bps < min_bps {
+            return CoverageStatus::Uncovered;
+        }
+        CoverageStatus::Covered(CoveredInfo { bps: coverage.bps })
+    }
+
+    /// Stop recording figures and answering `is_covered` during an incident.
+    /// Idempotent, and the event names the admin that asserted the state.
+    pub fn pause(env: Env) {
+        let by = admin(&env);
+        by.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        bump_instance(&env);
+        Paused { by }.publish(&env);
+    }
+
+    /// Clear the incident switch.
+    pub fn unpause(env: Env) {
+        let by = admin(&env);
+        by.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        bump_instance(&env);
+        Unpaused { by }.publish(&env);
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        paused_flag(&env)
+    }
+
+    /// Opt `sac` in to reading supply from `token.total_supply()` instead of
+    /// the posted snapshot. The snapshot is kept as the fallback.
+    pub fn enable_native_supply(env: Env, sac: Address, token: Address) {
+        admin(&env).require_auth();
+        ensure_listed(&env, &sac);
+        write_persistent(&env, &DataKey::NativeSupply(sac.clone()), &token);
+        bump_instance(&env);
+        NativeSupplyEnabled { sac, token }.publish(&env);
+    }
+
+    /// The opted-in token, or `None` when the asset reads the snapshot.
+    pub fn native_supply_token(env: Env, sac: Address) -> Option<Address> {
+        native_token(&env, &sac)
     }
 
     pub fn transfer_admin(env: Env, new_admin: Address) {
